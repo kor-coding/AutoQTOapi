@@ -40,6 +40,11 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root():
+    return {"ok": True, "service": "autoqto-api"}
+
+
 def db():
     return psycopg.connect(DATABASE_URL)
 
@@ -161,12 +166,16 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(defaul
     payload = await request.body()
     if not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(500, "Webhook secret not configured.")
+    if not stripe_signature:
+        raise HTTPException(400, "Missing Stripe-Signature header.")
     try:
         event = stripe.Webhook.construct_event(
             payload, stripe_signature, STRIPE_WEBHOOK_SECRET
         )
     except Exception as exc:
+        print(f"webhook signature failed: {type(exc).__name__}: {exc}")
         raise HTTPException(400, f"Bad signature: {exc}") from exc
+    print(f"webhook ok: {event.get('type')} {event.get('id')}")
 
     with db() as conn, conn.cursor() as cur:
         cur.execute(
