@@ -186,11 +186,16 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(defaul
         if cur.rowcount == 0:
             return {"ok": True, "duplicate": True}
 
-        obj = event["data"]["object"]
-        if event["type"] == "checkout.session.completed":
-            _apply_checkout(cur, obj)
-        elif event["type"].startswith("customer.subscription"):
-            _apply_subscription(cur, obj)
+        obj = _as_dict((event.get("data") or {}).get("object") or {})
+        try:
+            if event["type"] == "checkout.session.completed":
+                _apply_checkout(cur, obj)
+            elif event["type"].startswith("customer.subscription"):
+                _apply_subscription(cur, obj)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(500, f"handler: {type(exc).__name__}: {exc}") from exc
         conn.commit()
     return {"ok": True}
 
@@ -225,12 +230,36 @@ def claim(body: ClaimIn):
     return {"ok": True, "message": "Password set. Sign in on the app with this email."}
 
 
+def _as_dict(obj):
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    to_dict = getattr(obj, "to_dict_recursive", None) or getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return dict(obj)
+
+
+def _id_of(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("id")
+    return getattr(value, "id", None)
+
+
 def _apply_checkout(cur, session: dict) -> None:
+    session = _as_dict(session)
     if session.get("mode") not in (None, "subscription", "payment"):
         return
-    email = (session.get("customer_details") or {}).get("email") or session.get("customer_email")
-    customer = session.get("customer")
+    details = _as_dict(session.get("customer_details"))
+    email = details.get("email") or session.get("customer_email")
+    customer = _id_of(session.get("customer"))
     if not email or not customer:
+        print(f"checkout skipped: email={email!r} customer={customer!r}")
         return
     email_norm = email.strip().lower()
     cur.execute("SELECT id FROM users WHERE email_norm = %s", (email_norm,))
@@ -251,13 +280,13 @@ def _apply_checkout(cur, session: dict) -> None:
             (email, email_norm, email_norm.split("@")[0], customer),
         )
         user_id = cur.fetchone()[0]
-    sub_id = session.get("subscription")
+    sub_id = _id_of(session.get("subscription"))
     if sub_id:
         try:
             sub = stripe.Subscription.retrieve(sub_id)
             _apply_subscription(cur, sub)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"retrieve subscription {sub_id} failed: {exc}")
     cur.execute(
         "SELECT id FROM organizations WHERE stripe_customer_id = %s",
         (customer,),
@@ -275,13 +304,19 @@ def _apply_checkout(cur, session: dict) -> None:
 
 
 def _apply_subscription(cur, sub: dict) -> None:
-    customer = sub.get("customer")
+    sub = _as_dict(sub)
+    customer = _id_of(sub.get("customer"))
     price = None
     qty = 1
-    items = (sub.get("items") or {}).get("data") or []
+    period_end = sub.get("current_period_end")
+    period_start = sub.get("current_period_start")
+    items = _as_dict(sub.get("items")).get("data") or []
     if items:
-        price = (items[0].get("price") or {}).get("id")
-        qty = int(items[0].get("quantity") or 1)
+        item = _as_dict(items[0])
+        price = _id_of(item.get("price"))
+        qty = int(item.get("quantity") or 1)
+        period_end = period_end or item.get("current_period_end")
+        period_start = period_start or item.get("current_period_start")
     cur.execute(
         "SELECT id, is_enterprise, seats_per_purchase FROM plans WHERE stripe_price_id = %s",
         (price,),
@@ -290,8 +325,6 @@ def _apply_subscription(cur, sub: dict) -> None:
     plan_id = plan[0] if plan else "individual_month"
     is_ent = bool(plan[1]) if plan else False
     pack = int(plan[2]) if plan else 1
-    period_end = sub.get("current_period_end")
-    period_start = sub.get("current_period_start")
     end_ts = datetime.fromtimestamp(period_end, tz=timezone.utc) if period_end else None
     start_ts = datetime.fromtimestamp(period_start, tz=timezone.utc) if period_start else None
     status = sub.get("status") or "none"
