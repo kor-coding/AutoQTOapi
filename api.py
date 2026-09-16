@@ -406,3 +406,73 @@ def _apply_subscription(cur, sub: dict) -> None:
             ("Stripe customer", plan_id, seat_limit, customer,
              sub.get("id"), status, start_ts, end_ts),
         )
+
+
+class SetPasswordIn(BaseModel):
+    email: EmailStr | None = None
+    password: str
+    session_id: str | None = None
+
+
+@app.get("/v1/auth/checkout/{session_id}")
+def checkout_email(session_id: str):
+    try:
+        session = _as_dict(stripe.checkout.Session.retrieve(session_id))
+    except Exception as exc:
+        raise HTTPException(404, f"Unknown checkout session: {exc}") from exc
+    details = _as_dict(session.get("customer_details"))
+    email = (details.get("email") or session.get("customer_email") or "").strip().lower()
+    paid = session.get("payment_status") in ("paid", "no_payment_required")
+    return {
+        "email": email,
+        "paid": paid,
+        "status": session.get("status"),
+        "mode": session.get("mode"),
+    }
+
+
+@app.post("/v1/auth/set-password")
+def set_password(body: SetPasswordIn):
+    if len(body.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters.")
+    email = (body.email or "").strip().lower()
+    session = None
+    if body.session_id:
+        try:
+            session = _as_dict(stripe.checkout.Session.retrieve(body.session_id))
+        except Exception as exc:
+            raise HTTPException(400, f"Invalid checkout session: {exc}") from exc
+        details = _as_dict(session.get("customer_details"))
+        sess_email = (details.get("email") or session.get("customer_email") or "").strip().lower()
+        if sess_email:
+            email = sess_email
+        if session.get("payment_status") not in ("paid", "no_payment_required"):
+            raise HTTPException(402, "That checkout is not paid yet.")
+        with db() as conn, conn.cursor() as cur:
+            _apply_checkout(cur, session)
+            conn.commit()
+    if not email:
+        raise HTTPException(400, "Email is required.")
+    pw = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, password_hash FROM users WHERE email_norm = %s",
+            (email,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                404,
+                "No account for that email yet. Finish checkout first, or open this page from the Stripe confirmation link.",
+            )
+        if row[1] and not body.session_id:
+            raise HTTPException(
+                409,
+                "Password already set. To reset it, open this page from the purchase confirmation (it includes a session id).",
+            )
+        cur.execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s",
+            (pw, row[0]),
+        )
+        conn.commit()
+    return {"ok": True, "message": "Password saved. Open Auto QTO and sign in with this email."}
