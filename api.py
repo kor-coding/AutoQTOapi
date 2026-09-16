@@ -45,8 +45,19 @@ def root():
     return {"ok": True, "service": "autoqto-api"}
 
 
+@app.get("/v1/health/db")
+def health_db():
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        return {"ok": True, "db": "up"}
+    except Exception as exc:
+        raise HTTPException(500, f"db: {type(exc).__name__}: {exc}") from exc
+
+
 def db():
-    return psycopg.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL, connect_timeout=10)
 
 
 class LoginIn(BaseModel):
@@ -176,26 +187,51 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(defaul
         print(f"webhook signature failed: {type(exc).__name__}: {exc}")
         raise HTTPException(400, f"Bad signature: {exc}") from exc
     print(f"webhook ok: {event.get('type')} {event.get('id')}")
-
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO stripe_events (event_id, type) VALUES (%s,%s) "
-            "ON CONFLICT DO NOTHING",
-            (event["id"], event["type"]),
-        )
-        if cur.rowcount == 0:
-            return {"ok": True, "duplicate": True}
-
-        obj = _as_dict((event.get("data") or {}).get("object") or {})
-        try:
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO stripe_events (event_id, type) VALUES (%s,%s) "
+                "ON CONFLICT DO NOTHING",
+                (event["id"], event["type"]),
+            )
+            obj = _as_dict((event.get("data") or {}).get("object") or {})
             if event["type"] == "checkout.session.completed":
                 _apply_checkout(cur, obj)
             elif event["type"].startswith("customer.subscription"):
                 _apply_subscription(cur, obj)
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            raise HTTPException(500, f"handler: {type(exc).__name__}: {exc}") from exc
+            conn.commit()
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        print(f"webhook handler failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(500, f"handler: {type(exc).__name__}: {exc}") from exc
+    return {"ok": True}
+
+
+class RepairIn(BaseModel):
+    session_id: str | None = None
+    subscription_id: str | None = None
+
+
+@app.post("/v1/admin/repair")
+def repair(body: RepairIn, x_admin_key: str = Header(default="")):
+    """Replay a paid Checkout/Subscription into Neon. Header X-Admin-Key = JWT_SECRET."""
+    if not x_admin_key or x_admin_key != JWT_SECRET:
+        raise HTTPException(401, "Bad admin key.")
+    session = None
+    sub = None
+    if body.session_id:
+        session = _as_dict(stripe.checkout.Session.retrieve(body.session_id))
+    if body.subscription_id or (session and session.get("subscription")):
+        sid = body.subscription_id or _id_of(session.get("subscription"))
+        sub = stripe.Subscription.retrieve(sid)
+    if session is None and sub is None:
+        raise HTTPException(400, "Pass session_id or subscription_id.")
+    with db() as conn, conn.cursor() as cur:
+        if session:
+            _apply_checkout(cur, session)
+        elif sub:
+            _apply_subscription(cur, sub)
         conn.commit()
     return {"ok": True}
 
