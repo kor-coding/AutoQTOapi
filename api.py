@@ -180,24 +180,27 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(defaul
     if not stripe_signature:
         raise HTTPException(400, "Missing Stripe-Signature header.")
     try:
-        event = stripe.Webhook.construct_event(
+        raw_event = stripe.Webhook.construct_event(
             payload, stripe_signature, STRIPE_WEBHOOK_SECRET
         )
     except Exception as exc:
         print(f"webhook signature failed: {type(exc).__name__}: {exc}")
         raise HTTPException(400, f"Bad signature: {exc}") from exc
-    print(f"webhook ok: {event.get('type')} {event.get('id')}")
+    event = _as_dict(raw_event)
+    etype = event.get("type") or ""
+    eid = event.get("id") or ""
+    print(f"webhook ok: {etype} {eid}")
     try:
         with db() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO stripe_events (event_id, type) VALUES (%s,%s) "
                 "ON CONFLICT DO NOTHING",
-                (event["id"], event["type"]),
+                (eid, etype),
             )
             obj = _as_dict((event.get("data") or {}).get("object") or {})
-            if event["type"] == "checkout.session.completed":
+            if etype == "checkout.session.completed":
                 _apply_checkout(cur, obj)
-            elif event["type"].startswith("customer.subscription"):
+            elif etype.startswith("customer.subscription"):
                 _apply_subscription(cur, obj)
             conn.commit()
     except Exception as exc:
