@@ -4,6 +4,9 @@ Minimal AutoQTO account API.
   POST /v1/auth/login          {email, password} -> {token, entitlements}
   GET  /v1/me                  Bearer token -> entitlements
   POST /v1/stripe/webhook      Stripe events
+  GET  /v1/credit              Bearer -> {email, balance_usd}
+  POST /v1/credit/debit        Bearer {usd,effort,tokens_in,tokens_out}
+  POST /v1/credit/checkout     Bearer {pack_id} -> {checkout_url}
 
 Run:
   pip install fastapi uvicorn[standard] psycopg[binary] bcrypt stripe pyjwt
@@ -29,6 +32,26 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 TOKEN_DAYS = 60
+CREDIT_SUCCESS_URL = os.environ.get(
+    "CREDIT_SUCCESS_URL",
+    "https://kor-coding.github.io/AutoQTO-account/?credit=ok",
+)
+CREDIT_CANCEL_URL = os.environ.get(
+    "CREDIT_CANCEL_URL",
+    "https://kor-coding.github.io/AutoQTO-account/?credit=cancel",
+)
+# One-time AI packs: pack_id -> USD. Stripe Payment Links should charge the same.
+CREDIT_PACKS = {
+    "starter": 10.0,
+    "studio": 50.0,
+    "site": 150.0,
+}
+# Optional Stripe Price ids if you create Checkout Sessions instead of Payment Links.
+CREDIT_PRICE_IDS = {
+    "starter": os.environ.get("STRIPE_PRICE_STARTER", ""),
+    "studio": os.environ.get("STRIPE_PRICE_STUDIO", ""),
+    "site": os.environ.get("STRIPE_PRICE_SITE", ""),
+}
 
 stripe.api_key = STRIPE_SECRET_KEY
 app = FastAPI(title="AutoQTO accounts")
@@ -58,6 +81,36 @@ def health_db():
 
 def db():
     return psycopg.connect(DATABASE_URL, connect_timeout=10)
+
+
+_SCHEMA_READY = False
+
+
+def _ensure_credit_schema(cur) -> None:
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    cur.execute(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_credit_usd numeric(12,4) NOT NULL DEFAULT 0"
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_credit_ledger (
+            id            bigserial PRIMARY KEY,
+            user_id       uuid,
+            email         text,
+            kind          text NOT NULL,
+            usd           numeric(12,4) NOT NULL,
+            effort        text,
+            tokens_in     integer,
+            tokens_out    integer,
+            reason        text,
+            stripe_ref    text,
+            created_at    timestamptz NOT NULL DEFAULT now()
+        )
+        """
+    )
+    _SCHEMA_READY = True
 
 
 class LoginIn(BaseModel):
@@ -200,8 +253,11 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(defaul
             obj = _as_dict((event.get("data") or {}).get("object") or {})
             if etype == "checkout.session.completed":
                 _apply_checkout(cur, obj)
+                _apply_ai_pack(cur, obj)
             elif etype.startswith("customer.subscription"):
                 _apply_subscription(cur, obj)
+            elif etype == "payment_intent.succeeded":
+                _apply_ai_pack_from_intent(cur, obj)
             conn.commit()
     except Exception as exc:
         import traceback
@@ -476,3 +532,186 @@ def set_password(body: SetPasswordIn):
         )
         conn.commit()
     return {"ok": True, "message": "Password saved. Open Auto QTO and sign in with this email."}
+
+
+# ── AI credit (token wallet) ──────────────────────────────────────────────
+
+class DebitIn(BaseModel):
+    usd: float
+    effort: str | None = None
+    tokens_in: int = 0
+    tokens_out: int = 0
+    reason: str | None = None
+
+
+class CheckoutIn(BaseModel):
+    pack_id: str
+
+
+def _credit_of(cur, user_id) -> tuple[str, float]:
+    _ensure_credit_schema(cur)
+    cur.execute(
+        "SELECT email_norm, COALESCE(ai_credit_usd, 0) FROM users WHERE id = %s",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Unknown user.")
+    return str(row[0] or ""), float(row[1] or 0)
+
+
+def _add_credit(cur, user_id, email: str, usd: float, kind: str,
+                stripe_ref: str = "", reason: str = "") -> float:
+    _ensure_credit_schema(cur)
+    cur.execute(
+        "UPDATE users SET ai_credit_usd = COALESCE(ai_credit_usd, 0) + %s "
+        "WHERE id = %s RETURNING ai_credit_usd",
+        (usd, user_id),
+    )
+    row = cur.fetchone()
+    bal = float(row[0]) if row else 0.0
+    cur.execute(
+        """
+        INSERT INTO ai_credit_ledger
+            (user_id, email, kind, usd, reason, stripe_ref)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        """,
+        (user_id, email, kind, usd, reason, stripe_ref),
+    )
+    return bal
+
+
+@app.get("/v1/credit")
+def credit_get(user_id: str = Depends(_user_from_bearer)):
+    with db() as conn, conn.cursor() as cur:
+        email, bal = _credit_of(cur, user_id)
+    return {"email": email, "balance_usd": bal}
+
+
+@app.post("/v1/credit/debit")
+def credit_debit(body: DebitIn, user_id: str = Depends(_user_from_bearer)):
+    usd = max(0.0, float(body.usd))
+    with db() as conn, conn.cursor() as cur:
+        _ensure_credit_schema(cur)
+        email, bal = _credit_of(cur, user_id)
+        if usd > bal + 1e-9:
+            return {"ok": False, "balance_usd": bal, "blocked": True}
+        cur.execute(
+            "UPDATE users SET ai_credit_usd = COALESCE(ai_credit_usd, 0) - %s "
+            "WHERE id = %s RETURNING ai_credit_usd",
+            (usd, user_id),
+        )
+        new_bal = float(cur.fetchone()[0])
+        cur.execute(
+            """
+            INSERT INTO ai_credit_ledger
+                (user_id, email, kind, usd, effort, tokens_in, tokens_out, reason)
+            VALUES (%s,%s,'debit',%s,%s,%s,%s,%s)
+            """,
+            (user_id, email, -usd, body.effort, body.tokens_in,
+             body.tokens_out, body.reason),
+        )
+        conn.commit()
+    return {"ok": True, "balance_usd": new_bal, "blocked": False}
+
+
+@app.post("/v1/credit/checkout")
+def credit_checkout(body: CheckoutIn, user_id: str = Depends(_user_from_bearer)):
+    pack_id = (body.pack_id or "").strip().lower()
+    if pack_id not in CREDIT_PACKS:
+        raise HTTPException(400, "Unknown pack.")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(500, "Stripe is not configured on the API.")
+    usd = CREDIT_PACKS[pack_id]
+    with db() as conn, conn.cursor() as cur:
+        email, _bal = _credit_of(cur, user_id)
+    price = CREDIT_PRICE_IDS.get(pack_id) or ""
+    kwargs = dict(
+        mode="payment",
+        customer_email=email,
+        client_reference_id=email,
+        metadata={"kind": "ai_credit", "pack_id": pack_id, "usd": str(usd)},
+        success_url=CREDIT_SUCCESS_URL,
+        cancel_url=CREDIT_CANCEL_URL,
+    )
+    if price:
+        kwargs["line_items"] = [{"price": price, "quantity": 1}]
+    else:
+        kwargs["line_items"] = [{
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": int(round(usd * 100)),
+                "product_data": {"name": f"AutoQTO AI credit ({pack_id})"},
+            },
+            "quantity": 1,
+        }]
+    session = stripe.checkout.Session.create(**kwargs)
+    return {"checkout_url": session.url, "pack_id": pack_id, "usd": usd}
+
+
+def _user_by_email(cur, email: str):
+    email_norm = (email or "").strip().lower()
+    if not email_norm:
+        return None, ""
+    cur.execute("SELECT id FROM users WHERE email_norm = %s", (email_norm,))
+    row = cur.fetchone()
+    return (row[0] if row else None), email_norm
+
+
+def _apply_ai_pack(cur, session: dict) -> None:
+    session = _as_dict(session)
+    meta = _as_dict(session.get("metadata"))
+    if (meta.get("kind") or "") != "ai_credit" and session.get("mode") != "payment":
+        return
+    # Subscriptions already handled; only one-time AI packs.
+    if session.get("mode") == "subscription":
+        return
+    if meta.get("kind") and meta.get("kind") != "ai_credit":
+        return
+    details = _as_dict(session.get("customer_details"))
+    email = (
+        details.get("email")
+        or session.get("customer_email")
+        or session.get("client_reference_id")
+        or meta.get("email")
+        or ""
+    )
+    cents = session.get("amount_total")
+    usd = float(meta.get("usd") or 0) or (float(cents or 0) / 100.0)
+    if usd <= 0:
+        print(f"ai pack skipped: usd=0 session={session.get('id')}")
+        return
+    user_id, email_norm = _user_by_email(cur, email)
+    if user_id is None:
+        cur.execute(
+            """
+            INSERT INTO users (email, email_norm, display_name)
+            VALUES (%s, %s, %s)
+            RETURNING id
+            """,
+            (email_norm, email_norm, email_norm.split("@")[0] if email_norm else "buyer"),
+        )
+        user_id = cur.fetchone()[0]
+    _add_credit(
+        cur, user_id, email_norm, usd, "stripe",
+        stripe_ref=str(session.get("id") or ""),
+        reason=f"pack {meta.get('pack_id') or ''}".strip(),
+    )
+    print(f"ai pack +${usd:.2f} -> {email_norm}")
+
+
+def _apply_ai_pack_from_intent(cur, intent: dict) -> None:
+    intent = _as_dict(intent)
+    meta = _as_dict(intent.get("metadata"))
+    if meta.get("kind") != "ai_credit":
+        return
+    email = meta.get("email") or ""
+    usd = float(meta.get("usd") or 0) or (float(intent.get("amount") or 0) / 100.0)
+    user_id, email_norm = _user_by_email(cur, email)
+    if user_id is None or usd <= 0:
+        return
+    _add_credit(
+        cur, user_id, email_norm, usd, "stripe",
+        stripe_ref=str(intent.get("id") or ""),
+        reason=f"pack {meta.get('pack_id') or ''}".strip(),
+    )
